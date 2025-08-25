@@ -7,11 +7,50 @@ NKN_PATH="/home/nopeace/nkn/cmd/nknc/nknc"
 WALLET_PATH="/home/nopeace/nkn/cmd/nknc/wallet.json"
 NODE_SERVICE="nkn-node"
 
+# Локален RPC на nknd (по подразбиране)
+RPC_URL="http://127.0.0.1:30003"
+
 # Цветове
 GREEN="\e[32m"
 RED="\e[31m"
 YELLOW="\e[33m"
 RESET="\e[0m"
+
+# ─── Извличане на адреса от wallet.json (без парола) ───────────────────────────
+WALLET_ADDR=""
+if [[ -f "$WALLET_PATH" ]]; then
+  # Пробваме и с .Address, и с .address (зависи от версията)
+  WALLET_ADDR=$(jq -r '.Address // .address // empty' "$WALLET_PATH" 2>/dev/null)
+fi
+
+# ─── Хелпър: четене на баланса (RPC → fallback към nknc) ───────────────────────
+get_wallet_balance() {
+  local addr="$1"
+  local bal=""
+
+  # 1) През RPC (curl + getbalancebyaddr) – не изисква отключен wallet
+  if command -v curl >/dev/null 2>&1 && [[ -n "$addr" ]]; then
+    bal=$(curl -s -H "Content-Type: application/json" \
+      -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getbalancebyaddr\",\"params\":{\"address\":\"$addr\"}}" \
+      "$RPC_URL" | jq -r '.result.amount // .result.balance // empty' 2>/dev/null)
+  fi
+
+  # 2) Fallback през nknc (някои сборки връщат JSON, други – обикновен текст)
+  if [[ -z "$bal" || "$bal" == "null" ]]; then
+    if [[ -x "$NKN_PATH" && -n "$addr" ]]; then
+      local out
+      out=$("$NKN_PATH" wallet -l balance -a "$addr" 2>/dev/null)
+      # Опит за JSON parse
+      bal=$(echo "$out" | jq -r '.result.amount // .result.balance // empty' 2>/dev/null)
+      # Ако пак е празно, изтегляме първото число от текста
+      if [[ -z "$bal" || "$bal" == "null" ]]; then
+        bal=$(echo "$out" | grep -Eo '[0-9]+([.][0-9]+)?' | head -n1)
+      fi
+    fi
+  fi
+
+  echo "$bal"
+}
 
 # Log Activity Stats ключови думи
 declare -A patterns=(
@@ -60,18 +99,17 @@ print_health() {
   if [[ "$sync" == "PERSIST_FINISHED" ]]; then
     echo -e "Sync State       : ${GREEN}$sync${RESET}"
   else
-    echo -e "Sync State       : ${RED}$sync${RESET}"
+    echo -e "Sync State       : ${RED}${sync:-N/A}${RESET}"
   fi
 
-  # Relay Messages
+  # Relay Messages (форматиране със запетая за хилядни)
   relay=$($NKN_PATH info -s 2>/dev/null | jq -r .result.relayMessageCount)
-  # Форматиране със запетая за хилядни
   relay_fmt=$(echo "$relay" | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta')
- if [[ "$relay" -gt 0 ]]; then
+  if [[ "$relay" =~ ^[0-9]+$ && "$relay" -gt 0 ]]; then
     echo -e "Relay Messages   : ${GREEN}${relay_fmt}${RESET}"
   else
     echo -e "Relay Messages   : ${RED}0${RESET}"
-  fi 
+  fi
 
   # Uptime
   uptime_sec=$($NKN_PATH info -s 2>/dev/null | jq -r .result.uptime)
@@ -79,15 +117,18 @@ print_health() {
   hours=$(( (uptime_sec % 86400) / 3600 ))
   minutes=$(( (uptime_sec % 3600) / 60 ))
   seconds=$(( uptime_sec % 60 ))
-
   echo -e "Uptime           : ${YELLOW}${days}d ${hours}h ${minutes}m ${seconds}s${RESET}"
 
-  # Wallet Balance
-  balance=$($NKN_PATH wallet -l balance -n $WALLET_PATH --password-file /home/nopeace/nkn/wallet1.pass 2>/dev/null | jq -r '.result.amount')
+  # Wallet Balance (без да пипаме останалото)
+  balance=""
+  if [[ -n "$WALLET_ADDR" ]]; then
+    balance=$(get_wallet_balance "$WALLET_ADDR")
+  fi
+
   if [[ -z "$balance" || "$balance" == "null" ]]; then
     echo -e "Wallet Balance   : ${RED}N/A${RESET}"
   else
-    echo -e "Wallet Balance   : ${GREEN}$balance NKN${RESET}"
+    echo -e "Wallet Balance   : ${GREEN}${balance} NKN${RESET}"
   fi
 }
 
@@ -110,4 +151,3 @@ journalctl -u $NODE_SERVICE -f -n0 --no-pager | while read -r line; do
     echo "Обновено: $(date)"
   fi
 done
-
